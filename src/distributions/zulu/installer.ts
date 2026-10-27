@@ -1,0 +1,266 @@
+import * as core from '@actions/core';
+
+import path from 'path';
+import fs from 'fs';
+
+import {JavaBase} from '../base-installer.js';
+import {IZuluPackageDetails, IZuluVersions} from './models.js';
+import {isAlpineLinux} from '../platform-types.js';
+import {
+  cacheJdkDir,
+  extractJdkFile,
+  getDownloadArchiveExtension,
+  convertVersionToSemver,
+  isVersionSatisfies,
+  renameWinArchive
+} from '../../util.js';
+import {
+  JavaDownloadRelease,
+  JavaInstallerOptions,
+  JavaInstallerResults
+} from '../base-models.js';
+
+// The Azul Metadata API only reports the sha256 checksum on the
+// package-details endpoint, keyed by package_uuid, so the resolved candidate
+// must retain its UUID after sorting until the single follow-up request is made.
+interface ZuluResolvedRelease {
+  version: string;
+  url: string;
+  packageUuid: string;
+}
+
+function compareNumberArrays(a: number[], b: number[]): number {
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) {
+      return diff;
+    }
+  }
+  return 0;
+}
+
+export class ZuluDistribution extends JavaBase {
+  constructor(installerOptions: JavaInstallerOptions) {
+    super('Zulu', installerOptions);
+  }
+
+  protected async findPackageForDownload(
+    version: string
+  ): Promise<JavaDownloadRelease> {
+    const availableVersionsRaw = await this.getAvailableVersions();
+    const availableVersions = availableVersionsRaw.map(item => {
+      // The Azul Metadata API reports the JDK build number separately from
+      // java_version (e.g. java_version=[17,0,7], openjdk_build_number=7).
+      // Append it so the resulting semver retains the build (e.g. 17.0.7+7).
+      const javaVersion =
+        item.openjdk_build_number != null
+          ? [...item.java_version, item.openjdk_build_number]
+          : item.java_version;
+      return {
+        version: convertVersionToSemver(javaVersion),
+        url: item.download_url,
+        javaVersion: item.java_version,
+        buildNumber: item.openjdk_build_number ?? 0,
+        distroVersion: item.distro_version,
+        packageUuid: item.package_uuid
+      };
+    });
+
+    const satisfiedVersions = availableVersions
+      .filter(item => isVersionSatisfies(version, item.version))
+      .sort((a, b) => {
+        // Compare numerically rather than via semver build metadata: Azul
+        // hotfix releases carry a 4th java_version segment (e.g. 25.0.4.1+1,
+        // rendered as '25.0.4+1.1') that must rank above 25.0.4+7, whereas
+        // semver.compareBuild would order the build identifiers '7' > '1'.
+        return (
+          -compareNumberArrays(a.javaVersion, b.javaVersion) ||
+          b.buildNumber - a.buildNumber ||
+          -compareNumberArrays(a.distroVersion, b.distroVersion)
+        );
+      })
+      .map((item): ZuluResolvedRelease => ({
+        version: item.version,
+        url: item.url,
+        packageUuid: item.packageUuid
+      }));
+
+    const resolvedFullVersion =
+      satisfiedVersions.length > 0 ? satisfiedVersions[0] : null;
+    if (!resolvedFullVersion) {
+      const availableVersionStrings = availableVersions.map(
+        item => item.version
+      );
+      throw this.createVersionNotFoundError(version, availableVersionStrings);
+    }
+
+    const packageDetailsUrl = `https://api.azul.com/metadata/v1/zulu/packages/${resolvedFullVersion.packageUuid}`;
+    const packageDetails = (
+      await this.http.getJson<IZuluPackageDetails>(packageDetailsUrl)
+    ).result;
+    const digest = packageDetails?.sha256_hash?.match(/^[a-f0-9]{64}$/i)?.[0];
+
+    if (!digest) {
+      core.debug(
+        `No authoritative sha256 checksum is available for Zulu version ${resolvedFullVersion.version} from ${packageDetailsUrl}; skipping checksum verification.`
+      );
+    }
+
+    return {
+      version: resolvedFullVersion.version,
+      url: resolvedFullVersion.url,
+      checksum: digest
+        ? {
+            algorithm: 'sha256',
+            value: digest,
+            source: packageDetailsUrl
+          }
+        : undefined
+    };
+  }
+
+  protected async downloadTool(
+    javaRelease: JavaDownloadRelease
+  ): Promise<JavaInstallerResults> {
+    core.info(
+      `Downloading Java ${javaRelease.version} (${this.distribution}) from ${javaRelease.url} ...`
+    );
+    let javaArchivePath = await this.downloadAndVerify(javaRelease);
+
+    core.info(`Extracting Java archive...`);
+    const extension = getDownloadArchiveExtension();
+    if (process.platform === 'win32') {
+      javaArchivePath = renameWinArchive(javaArchivePath);
+    }
+    const extractedJavaPath = await extractJdkFile(javaArchivePath, extension);
+
+    const archiveName = fs.readdirSync(extractedJavaPath)[0];
+    const archivePath = path.join(extractedJavaPath, archiveName);
+
+    const javaPath = await cacheJdkDir(
+      archivePath,
+      this.toolcacheFolderName,
+      this.getToolcacheVersionName(javaRelease.version),
+      this.architecture
+    );
+
+    return {version: javaRelease.version, path: javaPath};
+  }
+
+  private async getAvailableVersions(): Promise<IZuluVersions[]> {
+    const arch = this.getArchitectureOptions();
+    const [bundleType, features] = this.packageType.split('+');
+    const platform = this.getPlatformOption();
+    const extension = getDownloadArchiveExtension();
+    const javafx = features?.includes('fx') ?? false;
+    const crac = features?.includes('crac') ?? false;
+    const releaseStatus = this.stable ? 'ga' : 'ea';
+
+    if (core.isDebug()) {
+      console.time('Retrieving available versions for Zulu took'); // eslint-disable-line no-console
+    }
+
+    const baseRequestArguments = [
+      `os=${platform}`,
+      `archive_type=${extension}`,
+      `java_package_type=${bundleType}`,
+      `javafx_bundled=${javafx}`,
+      `crac_supported=${crac}`,
+      `arch=${arch}`,
+      `release_status=${releaseStatus}`,
+      `availability_types=ca`
+    ].join('&');
+
+    // Need to iterate through all pages to retrieve the list of all versions.
+    // The Azul API doesn't return a total page count, so paginate until a page
+    // comes back empty (or short), guarding against a runaway loop with a cap.
+    const pageSize = 100;
+    const maxPages = 100;
+    let pageIndex = 1;
+    const availableVersions: IZuluVersions[] = [];
+    while (pageIndex <= maxPages) {
+      const requestArguments = `${baseRequestArguments}&page=${pageIndex}&page_size=${pageSize}`;
+      const availableVersionsUrl = `https://api.azul.com/metadata/v1/zulu/packages/?${requestArguments}`;
+      if (core.isDebug() && pageIndex === 1) {
+        // the url is identical except for the page number, so print it once for debug
+        core.debug(
+          `Gathering available versions from '${availableVersionsUrl}'`
+        );
+      }
+
+      const paginationPage = (
+        await this.http.getJson<IZuluVersions[]>(availableVersionsUrl)
+      ).result;
+      if (!paginationPage || paginationPage.length === 0) {
+        // stop paginating because we have reached the end of the results
+        break;
+      }
+
+      availableVersions.push(...paginationPage);
+
+      if (paginationPage.length < pageSize) {
+        // a short page means this was the last one; avoid an extra empty request
+        break;
+      }
+
+      pageIndex++;
+    }
+
+    if (pageIndex > maxPages) {
+      core.warning(
+        `Reached the maximum of ${maxPages} pages while listing Zulu versions; results may be truncated.`
+      );
+    }
+
+    if (core.isDebug()) {
+      core.startGroup('Print information about available versions');
+      console.timeEnd('Retrieving available versions for Zulu took'); // eslint-disable-line no-console
+      core.debug(`Available versions: [${availableVersions.length}]`);
+      core.debug(
+        availableVersions.map(item => item.java_version.join('.')).join(', ')
+      );
+      core.endGroup();
+    }
+
+    return availableVersions;
+  }
+
+  private getArchitectureOptions(): string {
+    const arch = this.distributionArchitecture();
+    switch (arch) {
+      case 'x64':
+        return 'x64';
+      case 'x86':
+        // The Azul Metadata API's "x86" value returns both 32-bit (i686) and
+        // 64-bit (x64) packages, which are indistinguishable by version and
+        // would let a 32-bit request resolve to a 64-bit JDK. Use "i686" to
+        // target only genuine 32-bit builds, matching the legacy API behavior.
+        return 'i686';
+      case 'armv7':
+        return 'arm';
+      case 'aarch64':
+      case 'arm64':
+        return 'aarch64';
+      default:
+        return arch;
+    }
+  }
+
+  private getPlatformOption(): string {
+    // Azul has own platform names so need to map them
+    switch (process.platform) {
+      case 'darwin':
+        return 'macos';
+      case 'win32':
+        return 'windows';
+      case 'linux':
+        // The new Metadata API's "linux" value returns both glibc and musl
+        // packages, so target the libc the runner actually has. A glibc JDK
+        // cannot run on Alpine.
+        return isAlpineLinux() ? 'linux_musl' : 'linux_glibc';
+      default:
+        return process.platform;
+    }
+  }
+}

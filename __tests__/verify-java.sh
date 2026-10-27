@@ -5,29 +5,55 @@ if [ -z "$1" ]; then
   exit 1
 fi
 
-java_version="$(java -version 2>&1)"
-echo "Found java version: $java_version"
-if [ -z "$(echo $java_version | grep --fixed-strings $1)" ]; then
-  echo "::error::Unexpected version"
-  exit 1
-fi
-
 if [ -z "$2" ]; then
   echo "::error::Must supply java path argument"
   exit 1
 fi
 
-if [ "$2" != "$JAVA_HOME" ]; then
-  echo "::error::Unexpected path"
-  exit 1
+EXPECTED_JAVA_VERSION=$1
+EXPECTED_PATH=$2
+SETUP_JAVA_VERSION=$3
+REQUIRE_CONCRETE_VERSION=$4
+
+EXPECTED_JAVA_VERSION=$(echo $EXPECTED_JAVA_VERSION | cut -d'+' -f1)
+if [[ $EXPECTED_JAVA_VERSION == 8 ]] || [[ $EXPECTED_JAVA_VERSION == 8.* ]]; then
+  EXPECTED_JAVA_VERSION="1.${EXPECTED_JAVA_VERSION}"
+fi
+if [[ $EXPECTED_JAVA_VERSION == *-ea* ]]; then
+  EXPECTED_JAVA_VERSION=$(echo $EXPECTED_JAVA_VERSION | cut -d'-' -f1 | cut -d'.' -f1)
 fi
 
-if [ -z "$3" ]; then
-  echo "::error::Must supply java version argument"
-  exit 1
-fi
+ACTUAL_JAVA_VERSION="$(java -version 2>&1)"
+echo "Found java version: $ACTUAL_JAVA_VERSION"
 
-if [ "$1" != "$3" ]; then
+GREP_RESULT=$(echo $ACTUAL_JAVA_VERSION | grep -E "^(openjdk|java) version \"$EXPECTED_JAVA_VERSION")
+if [ -z "$GREP_RESULT" ]; then
   echo "::error::Unexpected version"
+  echo "Expected version: $EXPECTED_JAVA_VERSION"
+  exit 1
+fi
+
+if [ -n "$SETUP_JAVA_VERSION" ]; then
+  OUTPUT_JAVA_VERSION=$(echo "$SETUP_JAVA_VERSION" | cut -d'+' -f1)
+  if [[ $OUTPUT_JAVA_VERSION == *-ea* ]]; then
+    OUTPUT_JAVA_VERSION=$(echo "$OUTPUT_JAVA_VERSION" | cut -d'-' -f1 | cut -d'.' -f1)
+  fi
+  OUTPUT_GREP_RESULT=$(echo "$ACTUAL_JAVA_VERSION" | grep -E "^(openjdk|java) version \"$OUTPUT_JAVA_VERSION")
+  if [ -z "$OUTPUT_GREP_RESULT" ]; then
+    echo "::error::The version output does not match the installed Java version"
+    echo "Version output: $SETUP_JAVA_VERSION"
+    exit 1
+  fi
+  if [ "$REQUIRE_CONCRETE_VERSION" = "true" ] && [ "$OUTPUT_JAVA_VERSION" = "$EXPECTED_JAVA_VERSION" ]; then
+    echo "::error::Expected a concrete version output for a floating JDK"
+    echo "Version output: $SETUP_JAVA_VERSION"
+    exit 1
+  fi
+fi
+
+if [ "$EXPECTED_PATH" != "$JAVA_HOME" ]; then
+  echo "::error::Unexpected path"
+  echo "Actual path: $JAVA_HOME"
+  echo "Expected path: $EXPECTED_PATH"
   exit 1
 fi
